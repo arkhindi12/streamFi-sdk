@@ -1,4 +1,4 @@
-import { StrKey } from '@stellar/stellar-sdk';
+import { Networks } from '@stellar/stellar-sdk';
 
 /** Stellar networks supported by public explorer links. */
 export type NetworkType = 'mainnet' | 'testnet' | 'futurenet';
@@ -35,6 +35,102 @@ export const EXPLORER_URLS: Record<
     account: 'https://stellar.expert/explorer/futurenet/account/',
   },
 };
+
+/**
+ * Networks the SDK can be configured against.
+ *
+ * `futurenet` and `standalone` are listed here because both are used for
+ * day-to-day development: futurenet mirrors the protocol upgrade before it
+ * reaches testnet, and standalone is the throwaway network `stellar
+ * contract deploy --network local` produces (#981).
+ */
+export type NetworkKey = 'mainnet' | 'testnet' | 'futurenet' | 'standalone';
+
+/** Contract roles a StreamFi deployment consists of. */
+export interface NetworkContracts {
+  factory: string | null;
+  governor: string | null;
+}
+
+/** Everything needed to talk to one Stellar network. */
+export interface NetworkConfig {
+  /** Soroban RPC endpoint. */
+  rpcUrl: string;
+  /** Passphrase that identifies the network when signing. */
+  networkPassphrase: string;
+  /**
+   * Stellar Expert bases for explorer links, or `null` where no public
+   * explorer tracks the network (standalone runs on your own machine).
+   */
+  explorer: { transaction: string; contract: string; account: string } | null;
+  /**
+   * Published contract IDs, or `null` per role where none is published.
+   *
+   * StreamFi has no canonical deployment on futurenet or standalone — those
+   * IDs are generated at deploy time from the deployer address and salt, so
+   * hardcoding one would point at somebody else's contract. Read them from
+   * your deployment output and pass them to the client explicitly.
+   */
+  contracts: NetworkContracts;
+}
+
+/**
+ * Per-network configuration: RPC endpoint, passphrase, explorer bases and
+ * published contract IDs.
+ *
+ * @example
+ * ```ts
+ * import { NETWORK_CONFIG } from './constants.js';
+ * const { rpcUrl, networkPassphrase } = NETWORK_CONFIG.standalone;
+ * ```
+ */
+export const NETWORK_CONFIG: Record<NetworkKey, NetworkConfig> = {
+  mainnet: {
+    rpcUrl: 'https://soroban-mainnet.stellar.org',
+    networkPassphrase: Networks.PUBLIC,
+    explorer: EXPLORER_URLS.mainnet,
+    contracts: { factory: null, governor: null },
+  },
+  testnet: {
+    rpcUrl: 'https://soroban-testnet.stellar.org',
+    networkPassphrase: Networks.TESTNET,
+    explorer: EXPLORER_URLS.testnet,
+    contracts: { factory: null, governor: null },
+  },
+  futurenet: {
+    rpcUrl: 'https://soroban-futurenet.stellar.org',
+    networkPassphrase: Networks.FUTURENET,
+    explorer: EXPLORER_URLS.futurenet,
+    contracts: { factory: null, governor: null },
+  },
+  standalone: {
+    // `stellar container start local` exposes Soroban RPC on this port.
+    rpcUrl: 'http://localhost:8000/soroban/rpc',
+    networkPassphrase: Networks.STANDALONE,
+    explorer: null,
+    contracts: { factory: null, governor: null },
+  },
+};
+
+/**
+ * Read a published contract ID for `network`.
+ *
+ * Throws when no ID is published instead of returning an empty string that
+ * would fail later inside a transaction with an opaque error. Pass the address
+ * you deployed yourself when that happens.
+ */
+export function contractIdFor(network: NetworkKey, role: keyof NetworkContracts): string {
+  const id = NETWORK_CONFIG[network].contracts[role];
+  if (!id) {
+    throw new Error(
+      `No canonical ${role} contract ID is published for the '${network}' network — ` +
+        'StreamFi contract IDs are generated per deployment. Deploy the contracts and ' +
+        `pass the ${role} address explicitly, e.g. new ConduitClient({ network: '${network}', ` +
+        `factoryAddress: '<your ${role} contract ID>' }).`,
+    );
+  }
+  return id;
+}
 
 /**
  * A syntactically valid Stellar G-address with no known keypair. Used only
