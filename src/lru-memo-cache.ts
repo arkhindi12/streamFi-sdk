@@ -27,6 +27,27 @@ export interface LruMemoCacheOptions {
   ttlMs?: number;
 }
 
+/**
+ * Bumped whenever the snapshot layout changes. Hydration refuses snapshots
+ * written by a different version instead of guessing at their shape.
+ */
+export const LRU_CACHE_SNAPSHOT_VERSION = 1;
+
+export interface LruMemoCacheEntry<V> {
+  key: unknown;
+  value: V;
+  /** Absolute epoch-ms expiry, or `null` for entries that never expire. */
+  expiresAt: number | null;
+}
+
+export interface LruMemoCacheSnapshot<V> {
+  version: number;
+  maxEntries: number;
+  ttlMs?: number;
+  /** Ordered oldest → newest so replaying them restores recency. */
+  entries: LruMemoCacheEntry<V>[];
+}
+
 export class LruMemoCache<K, V> {
   private readonly store = new Map<K, V>();
   /** Absolute expiry (epoch ms) for entries stored with a `ttlMs`. */
@@ -132,5 +153,105 @@ export class LruMemoCache<K, V> {
         : null;
 
     return { cacheHits: this.cacheHits, cacheMisses: this.cacheMisses, measuredSpeedupPercent };
+  }
+
+  /**
+   * Snapshot the cache as a versioned JSON string.
+   *
+   * Entries are written oldest → newest so that replaying them in order
+   * restores the LRU recency order, and expiries are written as absolute
+   * epoch-ms deadlines rather than remaining TTLs: a snapshot that sits in a
+   * transport for a while must not hand entries a fresh lease on life.
+   *
+   * Hit/miss counters are deliberately not serialized. They describe the
+   * process that produced them, and inventing numbers for a cache that has not
+   * served a single request yet would make `metrics()` lie.
+   */
+  serializeCache(): string {
+    const entries: LruMemoCacheEntry<V>[] = [];
+    for (const [key, value] of this.store) {
+      // `undefined` is indistinguishable from a miss through `get()`, so it is
+      // not worth carrying across a round trip.
+      if (value === undefined) continue;
+      const expiry = this.expiresAt.get(key);
+      entries.push({ key, value, expiresAt: expiry === undefined ? null : expiry });
+    }
+
+    const snapshot: LruMemoCacheSnapshot<V> = {
+      version: LRU_CACHE_SNAPSHOT_VERSION,
+      maxEntries: this.maxSize,
+      ...(this.defaultTtlMs !== undefined ? { ttlMs: this.defaultTtlMs } : {}),
+      entries,
+    };
+
+    return JSON.stringify(snapshot);
+  }
+
+  /**
+   * Rebuild a cache from a snapshot produced by {@link serializeCache}.
+   *
+   * The restored cache keeps the original `maxEntries`/`ttlMs` configuration,
+   * drops entries whose absolute expiry has already passed, and starts with
+   * zeroed metrics. A snapshot from an unknown version, or one that is not a
+   * well-formed object, throws `RangeError` rather than yielding a half-built
+   * cache.
+   */
+  static hydrateCache<K, V>(json: string): LruMemoCache<K, V> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      throw new RangeError('LruMemoCache snapshot is not valid JSON');
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new RangeError('LruMemoCache snapshot must be an object');
+    }
+
+    const snapshot = parsed as Partial<LruMemoCacheSnapshot<V>>;
+    if (snapshot.version !== LRU_CACHE_SNAPSHOT_VERSION) {
+      throw new RangeError(
+        `LruMemoCache snapshot version ${String(snapshot.version)} is not supported (expected ${LRU_CACHE_SNAPSHOT_VERSION})`
+      );
+    }
+
+    const maxEntries = Number(snapshot.maxEntries);
+    if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
+      throw new RangeError('LruMemoCache snapshot has an invalid maxEntries');
+    }
+    if (snapshot.ttlMs !== undefined && (!Number.isFinite(snapshot.ttlMs) || (snapshot.ttlMs as number) <= 0)) {
+      throw new RangeError('LruMemoCache snapshot has an invalid ttlMs');
+    }
+    if (!Array.isArray(snapshot.entries)) {
+      throw new RangeError('LruMemoCache snapshot has no entries array');
+    }
+
+    const cache = new LruMemoCache<K, V>(
+      snapshot.ttlMs !== undefined ? { maxEntries, ttlMs: snapshot.ttlMs as number } : { maxEntries }
+    );
+
+    const now = Date.now();
+    // A tampered snapshot can claim more entries than the cache may hold; keep
+    // the newest ones, which is what replaying in order would have produced.
+    const usable = snapshot.entries
+      .filter((entry): entry is LruMemoCacheEntry<V> => !!entry && typeof entry === 'object')
+      .slice(-maxEntries);
+
+    for (const entry of usable) {
+      if (!('key' in entry)) {
+        throw new RangeError('LruMemoCache snapshot entry is missing a key');
+      }
+      const expiresAt = entry.expiresAt ?? null;
+      if (expiresAt !== null && !Number.isFinite(expiresAt)) {
+        throw new RangeError('LruMemoCache snapshot entry has an invalid expiresAt');
+      }
+      // Dead on arrival: keeping it would only delay the miss by one lookup.
+      if (expiresAt !== null && expiresAt <= now) continue;
+
+      cache.store.set(entry.key as K, entry.value);
+      if (expiresAt !== null) cache.expiresAt.set(entry.key as K, expiresAt);
+    }
+
+    return cache;
   }
 }
